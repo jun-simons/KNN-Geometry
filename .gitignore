@@ -39,3 +39,12 @@
 
 # debug information files
 *.dwo
+
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+[Bb]uild/
+bin/
+obj/
