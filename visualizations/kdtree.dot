@@ -1,0 +1,85 @@
+graph G
+{
+
+label="Graph G. Num leaves: 20. Num items: 20."
+R0 ;
+R0 [label="R0"] ;
+R0 -- N1 ;
+N1 [label="N1"] ;
+N1 -- N2 ;
+N2 [label="N2"] ;
+N2 -- N3 ;
+N3 [label="N3"] ;
+N3 -- L4 ;
+L4 [label="L4, Size: 1"] ;
+N3 -- N5 ;
+N5 [label="N5"] ;
+N5 -- L6 ;
+L6 [label="L6, Size: 1"] ;
+N5 -- L7 ;
+L7 [label="L7, Size: 1"] ;
+N2 -- N8 ;
+N8 [label="N8"] ;
+N8 -- L9 ;
+L9 [label="L9, Size: 1"] ;
+N8 -- L10 ;
+L10 [label="L10, Size: 1"] ;
+N1 -- N11 ;
+N11 [label="N11"] ;
+N11 -- N12 ;
+N12 [label="N12"] ;
+N12 -- L13 ;
+L13 [label="L13, Size: 1"] ;
+N12 -- L14 ;
+L14 [label="L14, Size: 1"] ;
+N11 -- N15 ;
+N15 [label="N15"] ;
+N15 -- L16 ;
+L16 [label="L16, Size: 1"] ;
+N15 -- L17 ;
+L17 [label="L17, Size: 1"] ;
+R0 -- N18 ;
+N18 [label="N18"] ;
+N18 -- N19 ;
+N19 [label="N19"] ;
+N19 -- N20 ;
+N20 [label="N20"] ;
+N20 -- N21 ;
+N21 [label="N21"] ;
+N21 -- L22 ;
+L22 [label="L22, Size: 1"] ;
+N21 -- L23 ;
+L23 [label="L23, Size: 1"] ;
+N20 -- N24 ;
+N24 [label="N24"] ;
+N24 -- L25 ;
+L25 [label="L25, Size: 1"] ;
+N24 -- L26 ;
+L26 [label="L26, Size: 1"] ;
+N19 -- L27 ;
+L27 [label="L27, Size: 1"] ;
+N18 -- N28 ;
+N28 [label="N28"] ;
+N28 -- N29 ;
+N29 [label="N29"] ;
+N29 -- L30 ;
+L30 [label="L30, Size: 1"] ;
+N29 -- L31 ;
+L31 [label="L31, Size: 1"] ;
+N28 -- N32 ;
+N32 [label="N32"] ;
+N32 -- N33 ;
+N33 [label="N33"] ;
+N33 -- L34 ;
+L34 [label="L34, Size: 1"] ;
+N33 -- L35 ;
+L35 [label="L35, Size: 1"] ;
+N32 -- N36 ;
+N36 [label="N36"] ;
+N36 -- L37 ;
+L37 [label="L37, Size: 1"] ;
+N36 -- L38 ;
+L38 [label="L38, Size: 1"] ;
+
+}
+

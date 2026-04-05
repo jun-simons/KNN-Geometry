@@ -8,3 +8,5 @@ find_package(CGAL REQUIRED)
 
 add_executable(knn_kdtree_test main.cpp)
 target_link_libraries(knn_kdtree_test CGAL::CGAL)
+
+add_subdirectory(visualizations)
