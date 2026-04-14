@@ -322,10 +322,10 @@ public:
         tree_->build();
     }
 
-    KNNResult query(const Point_d &query, int k) const
+    KNNResult query(const Point_d &query, int k, double epsilon = 0.0) const
     {
         LabeledPoint q{query, -1, -1};
-        Neighbor_search search(*tree_, q, k, 0.0);
+        Neighbor_search search(*tree_, q, k, epsilon);
 
         std::vector<int> labels;
         std::vector<NeighborInfo> neighbors;
@@ -379,33 +379,94 @@ double average_of_vector(const std::vector<double> &values)
     return sum / values.size();
 }
 
+// -----------------------
+// Config + CLI parsing
+// -----------------------
+struct Config
+{
+    std::string filename;
+    int k = 3;
+    double train_fraction = 0.8;
+    bool has_header = false;
+    double epsilon = 0.0;
+    bool run_brute = true;
+};
+
+Config parse_args(int argc, char **argv)
+{
+    Config cfg;
+
+    auto usage = []()
+    {
+        std::cerr << "Usage: ./knn_kdtree_test --file <csv> [options]\n"
+                  << "  --file <path>     Input CSV file (required)\n"
+                  << "  --k <int>         Number of neighbors (default: 3)\n"
+                  << "  --train <float>   Train fraction (default: 0.8)\n"
+                  << "  --header          CSV has a header row\n"
+                  << "  --epsilon <float> Approximation factor for kD-tree (default: 0.0 = exact)\n"
+                  << "  --no-brute        Skip brute-force and only run kD-tree\n";
+    };
+
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+
+        auto next_val = [&]() -> std::string
+        {
+            if (++i >= argc)
+                throw std::runtime_error("Missing value for " + arg);
+            return argv[i];
+        };
+
+        if      (arg == "--file")     cfg.filename       = next_val();
+        else if (arg == "--k")        cfg.k              = std::stoi(next_val());
+        else if (arg == "--train")    cfg.train_fraction = std::stod(next_val());
+        else if (arg == "--header")   cfg.has_header     = true;
+        else if (arg == "--epsilon")  cfg.epsilon        = std::stod(next_val());
+        else if (arg == "--no-brute") cfg.run_brute      = false;
+        else
+        {
+            std::cerr << "Unknown argument: " << arg << "\n";
+            usage();
+            throw std::runtime_error("bad arguments");
+        }
+    }
+
+    if (cfg.filename.empty())
+    {
+        usage();
+        throw std::runtime_error("--file is required");
+    }
+
+    return cfg;
+}
+
 // Main
 int main(int argc, char **argv)
 {
-    if (argc < 2)
+    Config cfg;
+    try
     {
-        std::cerr << "Usage: ./knn_kdtree_test <csv_file> [k] [train_fraction] [has_header]\n";
-        std::cerr << "Example: ./knn_kdtree_test data.csv 3 0.8 1\n";
+        cfg = parse_args(argc, argv);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
 
-    std::string filename = argv[1];
-    int k = (argc >= 3) ? std::stoi(argv[2]) : 3;
-    double train_fraction = (argc >= 4) ? std::stod(argv[3]) : 0.8;
-    bool has_header = (argc >= 5) ? (std::stoi(argv[4]) != 0) : false;
-
     try
     {
-        auto data = load_csv_dataset(filename, has_header);
+        auto data = load_csv_dataset(cfg.filename, cfg.has_header);
 
-        if (data.size() <= static_cast<size_t>(k))
+        if (data.size() <= static_cast<size_t>(cfg.k))
         {
             throw std::runtime_error("Dataset too small relative to k");
         }
 
-        auto split = train_test_split(data, train_fraction, 42);
+        auto split = train_test_split(data, cfg.train_fraction, 42);
 
-        if (split.train.size() <= static_cast<size_t>(k) || split.test.empty())
+        if (split.train.size() <= static_cast<size_t>(cfg.k) || split.test.empty())
         {
             throw std::runtime_error("Train/test split invalid for chosen k");
         }
@@ -416,7 +477,9 @@ int main(int argc, char **argv)
         std::cout << "Dimension: " << dim << "\n";
         std::cout << "Train size: " << split.train.size() << "\n";
         std::cout << "Test size: " << split.test.size() << "\n";
-        std::cout << "k = " << k << "\n\n";
+        std::cout << "k = " << cfg.k << "\n";
+        std::cout << "epsilon = " << cfg.epsilon
+                  << (cfg.epsilon == 0.0 ? " (exact)" : " (approximate)") << "\n\n";
 
         // True labels
         std::vector<int> y_true;
@@ -426,122 +489,98 @@ int main(int argc, char **argv)
             y_true.push_back(p.label);
         }
 
-        // Brute-force timing
+        std::cout << std::fixed << std::setprecision(4);
+
+        // --- Brute-force ---
         std::vector<int> brute_preds_majority;
         std::vector<int> brute_preds_weighted;
-        std::vector<double> brute_conf_correct;
-        std::vector<double> brute_conf_wrong;
 
-        brute_preds_majority.reserve(split.test.size());
-        brute_preds_weighted.reserve(split.test.size());
-
-        auto brute_start = std::chrono::high_resolution_clock::now();
-        for (const auto &q : split.test)
+        if (cfg.run_brute)
         {
-            KNNResult result = query_bruteforce(split.train, q.features, k);
-            brute_preds_majority.push_back(result.prediction_majority);
-            brute_preds_weighted.push_back(result.prediction_weighted);
+            std::vector<double> brute_conf_correct;
+            std::vector<double> brute_conf_wrong;
+            brute_preds_majority.reserve(split.test.size());
+            brute_preds_weighted.reserve(split.test.size());
 
-            double conf = inverse_distance_confidence(result.neighbors);
-            if (result.prediction_majority == q.label)
+            auto brute_start = std::chrono::high_resolution_clock::now();
+            for (const auto &q : split.test)
             {
-                brute_conf_correct.push_back(conf);
+                KNNResult result = query_bruteforce(split.train, q.features, cfg.k);
+                brute_preds_majority.push_back(result.prediction_majority);
+                brute_preds_weighted.push_back(result.prediction_weighted);
+
+                double conf = inverse_distance_confidence(result.neighbors);
+                if (result.prediction_majority == q.label)
+                    brute_conf_correct.push_back(conf);
+                else
+                    brute_conf_wrong.push_back(conf);
             }
-            else
-            {
-                brute_conf_wrong.push_back(conf);
-            }
+            auto brute_end = std::chrono::high_resolution_clock::now();
+
+            double brute_ms =
+                std::chrono::duration<double, std::milli>(brute_end - brute_start).count();
+
+            std::cout << "Brute-force majority-vote accuracy: " << accuracy(y_true, brute_preds_majority) << "\n";
+            std::cout << "Brute-force weighted-vote accuracy:  " << accuracy(y_true, brute_preds_weighted) << "\n";
+            std::cout << "Brute-force total query time (ms):   " << brute_ms << "\n";
+            std::cout << "Brute-force avg/query (ms):          " << (brute_ms / split.test.size()) << "\n";
+            std::cout << "Brute-force avg confidence (correct):" << average_of_vector(brute_conf_correct) << "\n";
+            std::cout << "Brute-force avg confidence (wrong):  " << average_of_vector(brute_conf_wrong) << "\n\n";
         }
-        auto brute_end = std::chrono::high_resolution_clock::now();
 
-        double brute_ms =
-            std::chrono::duration<double, std::milli>(brute_end - brute_start).count();
-
-        double brute_acc_majority = accuracy(y_true, brute_preds_majority);
-        double brute_acc_weighted = accuracy(y_true, brute_preds_weighted);
-
-        // KD-tree timing
-        auto tree_build_start = std::chrono::high_resolution_clock::now();
-        KDTreeKNN kd_model(split.train);
-        auto tree_build_end = std::chrono::high_resolution_clock::now();
-
+        // --- KD-tree ---
         std::vector<int> kd_preds_majority;
         std::vector<int> kd_preds_weighted;
         std::vector<double> kd_conf_correct;
         std::vector<double> kd_conf_wrong;
-
         kd_preds_majority.reserve(split.test.size());
         kd_preds_weighted.reserve(split.test.size());
+
+        auto tree_build_start = std::chrono::high_resolution_clock::now();
+        KDTreeKNN kd_model(split.train);
+        auto tree_build_end = std::chrono::high_resolution_clock::now();
 
         auto kd_query_start = std::chrono::high_resolution_clock::now();
         for (const auto &q : split.test)
         {
-            KNNResult result = kd_model.query(q.features, k);
+            KNNResult result = kd_model.query(q.features, cfg.k, cfg.epsilon);
             kd_preds_majority.push_back(result.prediction_majority);
             kd_preds_weighted.push_back(result.prediction_weighted);
 
             double conf = inverse_distance_confidence(result.neighbors);
             if (result.prediction_majority == q.label)
-            {
                 kd_conf_correct.push_back(conf);
-            }
             else
-            {
                 kd_conf_wrong.push_back(conf);
-            }
         }
         auto kd_query_end = std::chrono::high_resolution_clock::now();
 
         double build_ms =
             std::chrono::duration<double, std::milli>(tree_build_end - tree_build_start).count();
-
         double kd_query_ms =
             std::chrono::duration<double, std::milli>(kd_query_end - kd_query_start).count();
 
-        double kd_acc_majority = accuracy(y_true, kd_preds_majority);
-        double kd_acc_weighted = accuracy(y_true, kd_preds_weighted);
+        std::cout << "KD-tree majority-vote accuracy:      " << accuracy(y_true, kd_preds_majority) << "\n";
+        std::cout << "KD-tree weighted-vote accuracy:      " << accuracy(y_true, kd_preds_weighted) << "\n";
+        std::cout << "KD-tree build time (ms):             " << build_ms << "\n";
+        std::cout << "KD-tree total query time (ms):       " << kd_query_ms << "\n";
+        std::cout << "KD-tree avg/query (ms):              " << (kd_query_ms / split.test.size()) << "\n";
+        std::cout << "KD-tree avg confidence (correct):    " << average_of_vector(kd_conf_correct) << "\n";
+        std::cout << "KD-tree avg confidence (wrong):      " << average_of_vector(kd_conf_wrong) << "\n\n";
 
-        // Output
-        std::cout << std::fixed << std::setprecision(4);
-
-        std::cout << "Brute-force majority-vote accuracy: " << brute_acc_majority << "\n";
-        std::cout << "Brute-force weighted-vote accuracy: " << brute_acc_weighted << "\n";
-        std::cout << "Brute-force total query time (ms): " << brute_ms << "\n";
-        std::cout << "Brute-force avg/query (ms): " << (brute_ms / split.test.size()) << "\n";
-        std::cout << "Brute-force avg confidence on correct predictions: "
-                  << average_of_vector(brute_conf_correct) << "\n";
-        std::cout << "Brute-force avg confidence on wrong predictions: "
-                  << average_of_vector(brute_conf_wrong) << "\n\n";
-
-        std::cout << "KD-tree majority-vote accuracy: " << kd_acc_majority << "\n";
-        std::cout << "KD-tree weighted-vote accuracy: " << kd_acc_weighted << "\n";
-        std::cout << "KD-tree build time (ms): " << build_ms << "\n";
-        std::cout << "KD-tree total query time (ms): " << kd_query_ms << "\n";
-        std::cout << "KD-tree avg/query (ms): " << (kd_query_ms / split.test.size()) << "\n";
-        std::cout << "KD-tree avg confidence on correct predictions: "
-                  << average_of_vector(kd_conf_correct) << "\n";
-        std::cout << "KD-tree avg confidence on wrong predictions: "
-                  << average_of_vector(kd_conf_wrong) << "\n\n";
-
-        int mismatches_majority = 0;
-        int mismatches_weighted = 0;
-
-        for (size_t i = 0; i < brute_preds_majority.size(); ++i)
+        // Mismatch comparison — only meaningful when both were run
+        if (cfg.run_brute)
         {
-            if (brute_preds_majority[i] != kd_preds_majority[i])
+            int mismatches_majority = 0;
+            int mismatches_weighted = 0;
+            for (size_t i = 0; i < brute_preds_majority.size(); ++i)
             {
-                mismatches_majority++;
+                if (brute_preds_majority[i] != kd_preds_majority[i]) mismatches_majority++;
+                if (brute_preds_weighted[i] != kd_preds_weighted[i]) mismatches_weighted++;
             }
-            if (brute_preds_weighted[i] != kd_preds_weighted[i])
-            {
-                mismatches_weighted++;
-            }
+            std::cout << "Prediction mismatches brute vs kd-tree (majority): " << mismatches_majority << "\n";
+            std::cout << "Prediction mismatches brute vs kd-tree (weighted): " << mismatches_weighted << "\n";
         }
-
-        std::cout << "Prediction mismatches between methods (majority): "
-                  << mismatches_majority << "\n";
-        std::cout << "Prediction mismatches between methods (weighted): "
-                  << mismatches_weighted << "\n";
     }
     catch (const std::exception &e)
     {
