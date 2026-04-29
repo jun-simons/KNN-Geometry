@@ -70,9 +70,14 @@ using Traits = CGAL::Search_traits<
     Point_d::const_iterator,
     Construct_cartesian_const_iterator_d>;
 
-using Distance = CGAL::Euclidean_distance<Traits>;
-using Tree = CGAL::Kd_tree<Traits>;
+using Distance    = CGAL::Euclidean_distance<Traits>;
+using Tree        = CGAL::Kd_tree<Traits>;
 using Neighbor_search = CGAL::K_neighbor_search<Traits, Distance>;
+
+// Midpoint tree: splits bounding box at spatial center, not data median.
+// Dense regions get smaller cells -> more points per cell at fixed depth -> higher compression.
+using MidpointSplitter = CGAL::Midpoint_of_rectangle<Traits>;
+using MidpointTree     = CGAL::Kd_tree<Traits, MidpointSplitter>;
 
 struct DatasetSplit
 {
@@ -311,9 +316,37 @@ KNNResult query_bruteforce(
 }
 
 // --- kD-tree spatial subsampling ---
-// Builds a temporary tree with the given bucket_size, then walks the leaves
-// Keep one representative per cell (leaf) using the centroid point and majority label)
-// picking a larger bucket_size rshoudl result in fewer cells and smaller subset
+
+// Shared: extract one centroid representative from a set of point handles
+LabeledPoint representative_of(
+    Tree::Leaf_node_const_handle leaf,
+    int dim)
+{
+    std::vector<double> centroid(dim, 0.0);
+    std::map<int, int> label_counts;
+    int count = 0;
+
+    for (auto it = leaf->begin(); it != leaf->end(); ++it)
+    {
+        for (int d = 0; d < dim; ++d)
+            centroid[d] += it->features[d];
+        label_counts[it->label]++;
+        ++count;
+    }
+
+    for (auto &v : centroid) v /= count;
+
+    int best_label = std::max_element(
+        label_counts.begin(), label_counts.end(),
+        [](const auto &a, const auto &b) { return a.second < b.second; }
+    )->first;
+
+    return {centroid, best_label, -1};
+}
+
+// Bucket-size subsampling: split until each cell has <= bucket_size points.
+// Compression ratio is ~uniform (B:1 everywhere). Advantage over random
+// subsampling: guaranteed spatial coverage — every occupied region keeps a rep.
 std::vector<LabeledPoint> subsample_via_kdtree(
     const std::vector<LabeledPoint> &data,
     int bucket_size)
@@ -329,21 +362,72 @@ std::vector<LabeledPoint> subsample_via_kdtree(
         if (node->is_leaf())
         {
             auto *leaf = static_cast<Tree::Leaf_node_const_handle>(node);
+            if (leaf->size() > 0)
+                result.push_back(representative_of(leaf, dim));
+        }
+        else
+        {
+            auto *internal = static_cast<Tree::Internal_node_const_handle>(node);
+            walk(internal->lower());
+            walk(internal->upper());
+        }
+    };
 
+    walk(temp_tree.root());
+    return result;
+}
+
+// Fixed-depth subsampling: split to a fixed depth (2^depth cells of equal
+// spatial volume), then take one representative per non-empty cell.
+// Dense regions have many points per fixed-volume cell -> high compression.
+// Sparse regions have few points per cell -> low compression.
+std::vector<LabeledPoint> subsample_via_kdtree_depth(
+    const std::vector<LabeledPoint> &data,
+    int max_depth)
+{
+    // bucket_size=1 forces the tree to split as deep as the data allows;
+    // we then stop early ourselves based on depth.
+    Tree temp_tree(data.begin(), data.end(), /*bucket_size=*/1);
+    temp_tree.build();
+
+    const int dim = static_cast<int>(data[0].features.size());
+    std::vector<LabeledPoint> result;
+
+    std::function<void(Tree::Node_const_handle, int)> walk =
+        [&](Tree::Node_const_handle node, int depth)
+    {
+        if (node->is_leaf() || depth >= max_depth)
+        {
+            // Collect all points in this subtree
             std::vector<double> centroid(dim, 0.0);
             std::map<int, int> label_counts;
             int count = 0;
 
-            for (auto it = leaf->begin(); it != leaf->end(); ++it)
+            std::function<void(Tree::Node_const_handle)> collect =
+                [&](Tree::Node_const_handle n)
             {
-                for (int d = 0; d < dim; ++d)
-                    centroid[d] += it->features[d];
-                label_counts[it->label]++;
-                ++count;
-            }
+                if (n->is_leaf())
+                {
+                    auto *leaf = static_cast<Tree::Leaf_node_const_handle>(n);
+                    for (auto it = leaf->begin(); it != leaf->end(); ++it)
+                    {
+                        for (int d = 0; d < dim; ++d)
+                            centroid[d] += it->features[d];
+                        label_counts[it->label]++;
+                        ++count;
+                    }
+                }
+                else
+                {
+                    auto *internal = static_cast<Tree::Internal_node_const_handle>(n);
+                    collect(internal->lower());
+                    collect(internal->upper());
+                }
+            };
+
+            collect(node);
 
             if (count == 0) return;
-
             for (auto &v : centroid) v /= count;
 
             int best_label = std::max_element(
@@ -356,12 +440,80 @@ std::vector<LabeledPoint> subsample_via_kdtree(
         else
         {
             auto *internal = static_cast<Tree::Internal_node_const_handle>(node);
-            walk(internal->lower());
-            walk(internal->upper());
+            walk(internal->lower(), depth + 1);
+            walk(internal->upper(), depth + 1);
         }
     };
 
-    walk(temp_tree.root());
+    walk(temp_tree.root(), 0);
+    return result;
+}
+
+// Midpoint fixed-depth subsampling: uses spatial midpoint splits so each cell
+// covers an equal volume of feature space. At a fixed depth, dense regions
+// hold more points per cell and are therefore compressed more aggressively.
+std::vector<LabeledPoint> subsample_via_midpoint_depth(
+    const std::vector<LabeledPoint> &data,
+    int max_depth)
+{
+    MidpointTree temp_tree(data.begin(), data.end(), /*bucket_size=*/1);
+    temp_tree.build();
+
+    const int dim = static_cast<int>(data[0].features.size());
+    std::vector<LabeledPoint> result;
+
+    std::function<void(MidpointTree::Node_const_handle, int)> walk =
+        [&](MidpointTree::Node_const_handle node, int depth)
+    {
+        if (node->is_leaf() || depth >= max_depth)
+        {
+            std::vector<double> centroid(dim, 0.0);
+            std::map<int, int> label_counts;
+            int count = 0;
+
+            std::function<void(MidpointTree::Node_const_handle)> collect =
+                [&](MidpointTree::Node_const_handle n)
+            {
+                if (n->is_leaf())
+                {
+                    auto *leaf = static_cast<MidpointTree::Leaf_node_const_handle>(n);
+                    for (auto it = leaf->begin(); it != leaf->end(); ++it)
+                    {
+                        for (int d = 0; d < dim; ++d)
+                            centroid[d] += it->features[d];
+                        label_counts[it->label]++;
+                        ++count;
+                    }
+                }
+                else
+                {
+                    auto *internal = static_cast<MidpointTree::Internal_node_const_handle>(n);
+                    collect(internal->lower());
+                    collect(internal->upper());
+                }
+            };
+
+            collect(node);
+
+            if (count == 0) return;
+            for (auto &v : centroid) v /= count;
+
+            int best_label = std::max_element(
+                label_counts.begin(), label_counts.end(),
+                [](const auto &a, const auto &b) { return a.second < b.second; }
+            )->first;
+
+            result.push_back({centroid, best_label, -1});
+        }
+        else
+        {
+            auto *internal = static_cast<MidpointTree::Internal_node_const_handle>(node);
+            walk(internal->lower(), depth + 1);
+            walk(internal->upper(), depth + 1);
+        }
+    };
+
+    walk(temp_tree.root(), 0);
     return result;
 }
 
@@ -446,6 +598,8 @@ struct Config
     double epsilon = 0.0;
     bool run_brute = true;
     int subsample_bucket = 0;   // 0 = disabled
+    int subsample_depth          = 0;   // 0 = disabled; mutually exclusive with others
+    int subsample_midpoint_depth = 0;   // 0 = disabled; mutually exclusive with others
 };
 
 Config parse_args(int argc, char **argv)
@@ -461,7 +615,10 @@ Config parse_args(int argc, char **argv)
                   << "  --header          CSV has a header row\n"
                   << "  --epsilon <float> Approximation factor for kD-tree (default: 0.0 = exact)\n"
                   << "  --no-brute        Skip brute-force and only run kD-tree\n"
-                  << "  --subsample <int> Subsample training set via kD-tree leaf cells of this size\n";
+                  << "  --subsample <int> Subsample via kD-tree bucket size (uniform compression)\n"
+                  << "  --subsample-depth <int> Subsample via fixed tree depth (median splits)\n"
+                  << "  --subsample-midpoint <int> Subsample via fixed depth with spatial midpoint splits\n"
+                  << "                             (truly equal-volume cells; dense regions compressed more)\n";
     };
 
     for (int i = 1; i < argc; ++i)
@@ -481,7 +638,9 @@ Config parse_args(int argc, char **argv)
         else if (arg == "--header")   cfg.has_header     = true;
         else if (arg == "--epsilon")   cfg.epsilon          = std::stod(next_val());
         else if (arg == "--no-brute")  cfg.run_brute        = false;
-        else if (arg == "--subsample") cfg.subsample_bucket = std::stoi(next_val());
+        else if (arg == "--subsample")       cfg.subsample_bucket = std::stoi(next_val());
+        else if (arg == "--subsample-depth")    cfg.subsample_depth          = std::stoi(next_val());
+        else if (arg == "--subsample-midpoint") cfg.subsample_midpoint_depth = std::stoi(next_val());
         else
         {
             std::cerr << "Unknown argument: " << arg << "\n";
@@ -529,15 +688,36 @@ int main(int argc, char **argv)
             throw std::runtime_error("Train/test split invalid for chosen k");
         }
 
-        // Optionally replace training set with kD-tree leaf representatives
+        // Optionally replace training set with kD-tree spatial representatives
+        if ((cfg.subsample_bucket > 0) + (cfg.subsample_depth > 0) + (cfg.subsample_midpoint_depth > 0) > 1)
+            throw std::runtime_error("--subsample, --subsample-depth, and --subsample-midpoint are mutually exclusive");
+
         if (cfg.subsample_bucket > 0)
         {
             size_t before = split.train.size();
             split.train = subsample_via_kdtree(split.train, cfg.subsample_bucket);
             if (split.train.size() <= static_cast<size_t>(cfg.k))
                 throw std::runtime_error("Subsampled training set too small relative to k");
-            std::cout << "Subsampled train: " << before << " -> " << split.train.size()
+            std::cout << "Subsampled train (bucket): " << before << " -> " << split.train.size()
                       << " points (bucket size " << cfg.subsample_bucket << ")\n";
+        }
+        else if (cfg.subsample_depth > 0)
+        {
+            size_t before = split.train.size();
+            split.train = subsample_via_kdtree_depth(split.train, cfg.subsample_depth);
+            if (split.train.size() <= static_cast<size_t>(cfg.k))
+                throw std::runtime_error("Subsampled training set too small relative to k");
+            std::cout << "Subsampled train (depth):    " << before << " -> " << split.train.size()
+                      << " points (max depth " << cfg.subsample_depth << ")\n";
+        }
+        else if (cfg.subsample_midpoint_depth > 0)
+        {
+            size_t before = split.train.size();
+            split.train = subsample_via_midpoint_depth(split.train, cfg.subsample_midpoint_depth);
+            if (split.train.size() <= static_cast<size_t>(cfg.k))
+                throw std::runtime_error("Subsampled training set too small relative to k");
+            std::cout << "Subsampled train (midpoint): " << before << " -> " << split.train.size()
+                      << " points (max depth " << cfg.subsample_midpoint_depth << ")\n";
         }
 
         const int dim = static_cast<int>(split.train[0].features.size());
