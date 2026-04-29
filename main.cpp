@@ -310,6 +310,61 @@ KNNResult query_bruteforce(
     return result;
 }
 
+// --- kD-tree spatial subsampling ---
+// Builds a temporary tree with the given bucket_size, then walks the leaves
+// Keep one representative per cell (leaf) using the centroid point and majority label)
+// picking a larger bucket_size rshoudl result in fewer cells and smaller subset
+std::vector<LabeledPoint> subsample_via_kdtree(
+    const std::vector<LabeledPoint> &data,
+    int bucket_size)
+{
+    Tree temp_tree(data.begin(), data.end(), bucket_size);
+    temp_tree.build();
+
+    const int dim = static_cast<int>(data[0].features.size());
+    std::vector<LabeledPoint> result;
+
+    std::function<void(Tree::Node_const_handle)> walk = [&](Tree::Node_const_handle node)
+    {
+        if (node->is_leaf())
+        {
+            auto *leaf = static_cast<Tree::Leaf_node_const_handle>(node);
+
+            std::vector<double> centroid(dim, 0.0);
+            std::map<int, int> label_counts;
+            int count = 0;
+
+            for (auto it = leaf->begin(); it != leaf->end(); ++it)
+            {
+                for (int d = 0; d < dim; ++d)
+                    centroid[d] += it->features[d];
+                label_counts[it->label]++;
+                ++count;
+            }
+
+            if (count == 0) return;
+
+            for (auto &v : centroid) v /= count;
+
+            int best_label = std::max_element(
+                label_counts.begin(), label_counts.end(),
+                [](const auto &a, const auto &b) { return a.second < b.second; }
+            )->first;
+
+            result.push_back({centroid, best_label, -1});
+        }
+        else
+        {
+            auto *internal = static_cast<Tree::Internal_node_const_handle>(node);
+            walk(internal->lower());
+            walk(internal->upper());
+        }
+    };
+
+    walk(temp_tree.root());
+    return result;
+}
+
 // --- KD-tree KNN wrapper ---
 class KDTreeKNN
 {
@@ -390,6 +445,7 @@ struct Config
     bool has_header = false;
     double epsilon = 0.0;
     bool run_brute = true;
+    int subsample_bucket = 0;   // 0 = disabled
 };
 
 Config parse_args(int argc, char **argv)
@@ -404,7 +460,8 @@ Config parse_args(int argc, char **argv)
                   << "  --train <float>   Train fraction (default: 0.8)\n"
                   << "  --header          CSV has a header row\n"
                   << "  --epsilon <float> Approximation factor for kD-tree (default: 0.0 = exact)\n"
-                  << "  --no-brute        Skip brute-force and only run kD-tree\n";
+                  << "  --no-brute        Skip brute-force and only run kD-tree\n"
+                  << "  --subsample <int> Subsample training set via kD-tree leaf cells of this size\n";
     };
 
     for (int i = 1; i < argc; ++i)
@@ -422,8 +479,9 @@ Config parse_args(int argc, char **argv)
         else if (arg == "--k")        cfg.k              = std::stoi(next_val());
         else if (arg == "--train")    cfg.train_fraction = std::stod(next_val());
         else if (arg == "--header")   cfg.has_header     = true;
-        else if (arg == "--epsilon")  cfg.epsilon        = std::stod(next_val());
-        else if (arg == "--no-brute") cfg.run_brute      = false;
+        else if (arg == "--epsilon")   cfg.epsilon          = std::stod(next_val());
+        else if (arg == "--no-brute")  cfg.run_brute        = false;
+        else if (arg == "--subsample") cfg.subsample_bucket = std::stoi(next_val());
         else
         {
             std::cerr << "Unknown argument: " << arg << "\n";
@@ -469,6 +527,17 @@ int main(int argc, char **argv)
         if (split.train.size() <= static_cast<size_t>(cfg.k) || split.test.empty())
         {
             throw std::runtime_error("Train/test split invalid for chosen k");
+        }
+
+        // Optionally replace training set with kD-tree leaf representatives
+        if (cfg.subsample_bucket > 0)
+        {
+            size_t before = split.train.size();
+            split.train = subsample_via_kdtree(split.train, cfg.subsample_bucket);
+            if (split.train.size() <= static_cast<size_t>(cfg.k))
+                throw std::runtime_error("Subsampled training set too small relative to k");
+            std::cout << "Subsampled train: " << before << " -> " << split.train.size()
+                      << " points (bucket size " << cfg.subsample_bucket << ")\n";
         }
 
         const int dim = static_cast<int>(split.train[0].features.size());
